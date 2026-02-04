@@ -20,6 +20,9 @@ dp = Dispatcher()
 api = Ryanair(currency="EUR")
 scheduler = AsyncIOScheduler()
 
+# When user sends only "ADD FR1234", we wait for "YYYY-MM-DD ORIGIN DEST"
+pending_add: dict[int, str] = {}
+
 
 def _flight_number(flight) -> str:
     """Flight number from ryanair-py (3.x: flightNumber, older: flight_number)."""
@@ -106,10 +109,11 @@ async def check_prices():
 async def cmd_start(message: types.Message):
     await message.answer("✈️ **Ryanair Tracker Active**\n\n"
                          "Commands:\n"
-                         "• `ADD [FLIGHT] [DATE] [ORIGIN] [DEST]` e.g. `ADD FR1234 2026-05-20 VNO BVA`\n"
+                         "• `ADD [FLIGHT]` or `ADD FR1234 2026-05-20 VNO BVA`\n"
                          "• `/list` - see your active tracks\n"
                          "• `/help` - how to add a flight\n"
-                         "• `/clear` - delete all your tracks")
+                         "• `/clear` - delete all your tracks\n"
+                         "• `/cancel` - cancel adding (when asked for date and route)")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -121,9 +125,9 @@ async def cmd_help(message: types.Message):
         "• **Date** — departure date: `YYYY-MM-DD` (e.g. `2026-05-20`)\n"
         "• **Origin** — 3-letter airport code (e.g. `VNO` for Vilnius)\n"
         "• **Destination** — 3-letter airport code (e.g. `BVA` for Paris Beauvais)\n\n"
-        "Example:\n"
-        "`ADD FR1234 2026-05-20 VNO BVA`\n\n"
-        "You can find flight codes and airport codes on ryanair.com."
+        "**Short form:** send only `ADD FR1234`, then send one line: `YYYY-MM-DD ORIGIN DEST`\n\n"
+        "**Full form:** `ADD FR1234 2026-05-20 VNO BVA`\n\n"
+        "Find flight and airport codes on ryanair.com."
     )
 
 @dp.message(Command("list"))
@@ -147,61 +151,119 @@ async def cmd_clear(message: types.Message):
     conn.close()
     await message.answer("All your tracking data has been deleted.")
 
+def _parse_date_route(text: str) -> tuple[str, str, str] | None:
+    """Parse 'YYYY-MM-DD ORIGIN DEST' (3 parts). Returns (date_str, origin, dest) or None."""
+    parts = (text or "").strip().split()
+    if len(parts) != 3:
+        return None
+    date_str, origin, dest = parts
+    if len(origin) != 3 or len(dest) != 3:
+        return None
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+        return date_str, origin.upper(), dest.upper()
+    except ValueError:
+        return None
+
+
+async def _do_add_flight(chat_id: int, flight_code_norm: str, date_str: str, origin: str, dest: str) -> str | None:
+    """Add one flight. Returns None on success, or error message."""
+    existing = get_tracked_flights(chat_id)
+    if len(existing) >= MAX_FLIGHTS:
+        return f"Limit reached! Max {MAX_FLIGHTS} flights."
+    try:
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return "Invalid date. Use YYYY-MM-DD."
+    trips = api.get_cheapest_flights(origin, date_obj, date_obj, destination_airport=dest)
+    if not trips:
+        return f"No flights found for {origin}->{dest} on {date_str}."
+    match = next((t for t in trips if _flight_number(t) == flight_code_norm), None)
+    if not match:
+        available = ", ".join(_flight_number(t) for t in trips)
+        return f"Flight {flight_code_norm} not found on {date_str} for {origin}->{dest}. Available: {available}."
+    conn = sqlite3.connect('tracker.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO flights (chat_id, origin, destination, date, flight_number, last_price)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (chat_id, origin, dest, date_str, _flight_number(match), match.price))
+    conn.commit()
+    conn.close()
+    return None  # success
+
+
 @dp.message()
 async def handle_message(message: types.Message):
-    if message.text and message.text.upper().startswith("ADD"):
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+
+    # Second step: user previously sent "ADD FR1234", now sends "YYYY-MM-DD ORIGIN DEST"
+    if chat_id in pending_add:
+        parsed = _parse_date_route(text)
+        if parsed:
+            date_str, origin, dest = parsed
+            flight_code_norm = pending_add.pop(chat_id)
+            err = await _do_add_flight(chat_id, flight_code_norm, date_str, origin, dest)
+            if err:
+                pending_add[chat_id] = flight_code_norm  # keep pending so they can retry
+                await message.answer(f"⚠️ {err}")
+            else:
+                await message.answer(
+                    f"✅ Now tracking {flight_code_norm} ({origin}→{dest}) on {date_str}. "
+                    "Check /list for price."
+                )
+            return
+        else:
+            # Invalid format — remind and keep pending
+            await message.answer(
+                "Send date and route in one line: **YYYY-MM-DD ORIGIN DEST**\n"
+                "Example: 2026-05-20 VNO BVA\n\nOr send /cancel to cancel."
+            )
+            return
+
+    if text.upper().startswith("ADD"):
         try:
-            parts = message.text.split()
+            parts = text.split()
+            if len(parts) == 2:
+                # Only flight number: ADD FR1234
+                _, flight_code = parts
+                flight_code_norm = _normalize_flight_code(flight_code)
+                if not flight_code_norm:
+                    await message.answer("Enter a valid flight code (e.g. FR1234).")
+                    return
+                pending_add[chat_id] = flight_code_norm
+                await message.answer(
+                    f"Flight **{flight_code_norm}**. Now send date and route in one line:\n"
+                    "`YYYY-MM-DD ORIGIN DEST`\nExample: 2026-05-20 VNO BVA"
+                )
+                return
             if len(parts) != 5:
                 await message.answer(
-                    "Usage: ADD [FLIGHT] [YYYY-MM-DD] [ORIGIN] [DEST]\n"
-                    "Example: ADD FR1234 2026-05-20 VNO BVA"
+                    "Usage: `ADD FR1234` then send date and route, or full: "
+                    "`ADD FR1234 2026-05-20 VNO BVA`"
                 )
                 return
 
             _, flight_code, date_str, origin, dest = parts
             origin, dest = origin.upper(), dest.upper()
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
             flight_code_norm = _normalize_flight_code(flight_code)
 
-            # Check limit
-            existing = get_tracked_flights(message.chat.id)
-            if len(existing) >= MAX_FLIGHTS:
-                await message.answer(f"Limit reached! Max {MAX_FLIGHTS} flights.")
-                return
-
-            trips = api.get_cheapest_flights(origin, date_obj, date_obj, destination_airport=dest)
-            if not trips:
-                await message.answer(f"No flights found for {origin}->{dest} on {date_str}.")
-                return
-
-            # Find the flight matching the requested code (API returns cheapest; may be only one)
-            match = next((t for t in trips if _flight_number(t) == flight_code_norm), None)
-            if not match:
-                available = ", ".join(_flight_number(t) for t in trips)
+            err = await _do_add_flight(chat_id, flight_code_norm, date_str, origin, dest)
+            if err:
+                await message.answer(f"⚠️ {err}")
+            else:
                 await message.answer(
-                    f"Flight {flight_code_norm} not found on {date_str} for {origin}->{dest}. "
-                    f"Available on that route/date: {available}."
+                    f"✅ Now tracking {flight_code_norm} ({origin}→{dest}) on {date_str}. Check /list."
                 )
-                return
-
-            conn = sqlite3.connect('tracker.db')
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO flights (chat_id, origin, destination, date, flight_number, last_price)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (message.chat.id, origin, dest, date_str, _flight_number(match), match.price))
-            conn.commit()
-            conn.close()
-
-            await message.answer(
-                f"✅ Now tracking {_flight_number(match)} ({origin}→{dest}) on {date_str}. "
-                f"Price: {match.price}€"
-            )
-        except ValueError as e:
-            await message.answer("Invalid date. Use YYYY-MM-DD.")
         except Exception as e:
             await message.answer(f"⚠️ Error: {str(e)}")
+        return
+
+    # Cancel pending add on /cancel
+    if text.lower() == "/cancel" and chat_id in pending_add:
+        pending_add.pop(chat_id)
+        await message.answer("Cancelled.")
 
 # --- RUN ---
 async def main():
