@@ -1,0 +1,11 @@
+# Local
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.env
+
+# Bot data (do not commit DB or secrets)
+tracker.db
+*.db
