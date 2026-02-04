@@ -25,6 +25,16 @@ def _flight_number(flight) -> str:
     """Flight number from ryanair-py (3.x: flightNumber, older: flight_number)."""
     return getattr(flight, 'flightNumber', None) or getattr(flight, 'flight_number', '')
 
+
+def _normalize_flight_code(code: str) -> str:
+    """Normalize user input to API format (e.g. FR1234 -> FR 1234)."""
+    code = (code or "").strip().upper()
+    if not code:
+        return ""
+    if code.startswith("FR") and len(code) > 2 and code[2] != " ":
+        return f"FR {code[2:]}"
+    return code
+
 # --- DATABASE OPERATIONS ---
 def init_db():
     conn = sqlite3.connect('tracker.db')
@@ -96,9 +106,25 @@ async def check_prices():
 async def cmd_start(message: types.Message):
     await message.answer("✈️ **Ryanair Tracker Active**\n\n"
                          "Commands:\n"
-                         "• `ADD VNO BVA 2026-05-20` - track a route\n"
+                         "• `ADD [FLIGHT] [DATE] [ORIGIN] [DEST]` e.g. `ADD FR1234 2026-05-20 VNO BVA`\n"
                          "• `/list` - see your active tracks\n"
+                         "• `/help` - how to add a flight\n"
                          "• `/clear` - delete all your tracks")
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "📌 **How to add a flight**\n\n"
+        "Send a line in this format:\n"
+        "`ADD [flight code] [date] [origin] [destination]`\n\n"
+        "• **Flight code** — Ryanair number, e.g. `FR1234` or `FR 1234`\n"
+        "• **Date** — departure date: `YYYY-MM-DD` (e.g. `2026-05-20`)\n"
+        "• **Origin** — 3-letter airport code (e.g. `VNO` for Vilnius)\n"
+        "• **Destination** — 3-letter airport code (e.g. `BVA` for Paris Beauvais)\n\n"
+        "Example:\n"
+        "`ADD FR1234 2026-05-20 VNO BVA`\n\n"
+        "You can find flight codes and airport codes on ryanair.com."
+    )
 
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
@@ -126,13 +152,17 @@ async def handle_message(message: types.Message):
     if message.text and message.text.upper().startswith("ADD"):
         try:
             parts = message.text.split()
-            if len(parts) != 4:
-                await message.answer("Usage: ADD [ORIGIN] [DEST] [YYYY-MM-DD]")
+            if len(parts) != 5:
+                await message.answer(
+                    "Usage: ADD [FLIGHT] [YYYY-MM-DD] [ORIGIN] [DEST]\n"
+                    "Example: ADD FR1234 2026-05-20 VNO BVA"
+                )
                 return
 
-            _, origin, dest, date_str = parts
+            _, flight_code, date_str, origin, dest = parts
             origin, dest = origin.upper(), dest.upper()
             date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            flight_code_norm = _normalize_flight_code(flight_code)
 
             # Check limit
             existing = get_tracked_flights(message.chat.id)
@@ -140,23 +170,36 @@ async def handle_message(message: types.Message):
                 await message.answer(f"Limit reached! Max {MAX_FLIGHTS} flights.")
                 return
 
-            # get_cheapest_flights returns at most 1 flight per route/date in 3.x
             trips = api.get_cheapest_flights(origin, date_obj, date_obj, destination_airport=dest)
             if not trips:
                 await message.answer(f"No flights found for {origin}->{dest} on {date_str}.")
                 return
 
+            # Find the flight matching the requested code (API returns cheapest; may be only one)
+            match = next((t for t in trips if _flight_number(t) == flight_code_norm), None)
+            if not match:
+                available = ", ".join(_flight_number(t) for t in trips)
+                await message.answer(
+                    f"Flight {flight_code_norm} not found on {date_str} for {origin}->{dest}. "
+                    f"Available on that route/date: {available}."
+                )
+                return
+
             conn = sqlite3.connect('tracker.db')
             cursor = conn.cursor()
-            for t in trips:
-                cursor.execute('''
-                    INSERT INTO flights (chat_id, origin, destination, date, flight_number, last_price)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (message.chat.id, origin, dest, date_str, _flight_number(t), t.price))
+            cursor.execute('''
+                INSERT INTO flights (chat_id, origin, destination, date, flight_number, last_price)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (message.chat.id, origin, dest, date_str, _flight_number(match), match.price))
             conn.commit()
             conn.close()
 
-            await message.answer(f"✅ Now tracking {len(trips)} flight(s) for {date_str}!")
+            await message.answer(
+                f"✅ Now tracking {_flight_number(match)} ({origin}→{dest}) on {date_str}. "
+                f"Price: {match.price}€"
+            )
+        except ValueError as e:
+            await message.answer("Invalid date. Use YYYY-MM-DD.")
         except Exception as e:
             await message.answer(f"⚠️ Error: {str(e)}")
 
