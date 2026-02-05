@@ -106,7 +106,7 @@ You will set the same variable in Railway in a later step.
 ## 8. Test the bot
 
 1. Open Telegram and find your bot.
-2. Send `/start` or `ADD FR1234 2026-05-20 VNO BVA` (flight code, date, origin, dest).
+2. Send `/start` or `ADD FR1234 2026-05-20` (flight code and date).
 3. If the bot answers, it’s running on Railway.
 
 ---
