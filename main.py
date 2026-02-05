@@ -34,12 +34,10 @@ def _flight_number(flight) -> str:
 
 
 def _normalize_flight_code(code: str) -> str:
-    """Normalize user input to API format (e.g. FR1234 -> FR 1234)."""
-    code = (code or "").strip().upper()
+    """Normalize user input to API format (e.g. FR1234 / FR 1234 -> FR1234)."""
+    code = (code or "").strip().upper().replace(" ", "")
     if not code:
         return ""
-    if code.startswith("FR") and len(code) > 2 and code[2] != " ":
-        return f"FR {code[2:]}"
     return code
 
 # --- DATABASE OPERATIONS ---
@@ -128,6 +126,7 @@ async def cmd_start(message: types.Message):
     await message.answer("✈️ **Ryanair Tracker Active**\n\n"
                          "Commands:\n"
                          "• `ADD FR1234 2026-05-20` — flight + date (route found automatically)\n"
+                         "• `ADD FR1234 2026-05-20 VNO BVA` — flight + date + origin/destination\n"
                          "• `delete FR1234` - stop tracking this flight\n"
                          "• `/list` - see your active tracks\n"
                          "• `/help` - how to add a flight\n"
@@ -141,7 +140,11 @@ async def cmd_help(message: types.Message):
         "• Add a new flight to track. Route is found automatically.\n"
         "• Flight code — Ryanair number, e.g. `FR1234` or `FR 1234`\n"
         "• Date — departure date: `YYYY-MM-DD` (e.g. `2026-05-20`)\n"
-        "Example: `ADD FR1234 2026-05-20`\n\n"
+        "Example (auto route): `ADD FR1234 2026-05-20`\n\n"
+        "`ADD [flight code] [date] [origin] [destination]`\n"
+        "• Add a flight when you know both airports (more reliable).\n"
+        "• Origin/Destination — 3-letter airport codes (e.g. `VNO`, `BVA`)\n"
+        "Example (explicit route): `ADD FR1234 2026-05-20 VNO BVA`\n\n"
         "`delete [flight code]`\n"
         "• Stop tracking all flights with this code in this chat.\n"
         "Example: `delete FR1234`\n\n"
@@ -179,7 +182,7 @@ async def _find_flight_on_date(flight_code_norm: str, date_obj) -> tuple[str, st
         try:
             trips = api.get_cheapest_flights(origin, date_obj, date_obj)
             for t in trips or []:
-                if _flight_number(t) == flight_code_norm:
+                if _normalize_flight_code(_flight_number(t)) == flight_code_norm:
                     return (t.origin, t.destination, t.price)
         except Exception:
             pass
@@ -199,7 +202,7 @@ async def _do_add_flight(chat_id: int, flight_code_norm: str, date_str: str, ori
     trips = api.get_cheapest_flights(origin, date_obj, date_obj, destination_airport=dest)
     if not trips:
         return f"No flights found for {origin}->{dest} on {date_str}."
-    match = next((t for t in trips if _flight_number(t) == flight_code_norm), None)
+    match = next((t for t in trips if _normalize_flight_code(_flight_number(t)) == flight_code_norm), None)
     if not match:
         available = ", ".join(_flight_number(t) for t in trips)
         return f"Flight {flight_code_norm} not found on {date_str} for {origin}->{dest}. Available: {available}."
@@ -224,6 +227,22 @@ async def handle_message(message: types.Message):
         # ADD command
         if upper_text.startswith("ADD"):
             parts = text.split()
+            if len(parts) == 5:
+                # ADD flight date origin dest
+                _, flight_code, date_str, origin, dest = parts
+                origin, dest = origin.upper(), dest.upper()
+                flight_code_norm = _normalize_flight_code(flight_code)
+                if not flight_code_norm:
+                    await message.answer("Enter a valid flight code (e.g. FR1234).")
+                    return
+                err = await _do_add_flight(chat_id, flight_code_norm, date_str, origin, dest)
+                if err:
+                    await message.answer(f"⚠️ {err}")
+                else:
+                    await message.answer(
+                        f"✅ Now tracking {flight_code_norm} ({origin}→{dest}) on {date_str}. Check /list."
+                    )
+                return
             if len(parts) == 3:
                 # ADD flight date
                 _, flight_code, date_str = parts
@@ -249,11 +268,12 @@ async def handle_message(message: types.Message):
                         )
                 else:
                     await message.answer(
-                        f"Flight {flight_code_norm} not found on {date_str}."
+                        f"Flight {flight_code_norm} not found on {date_str}. "
+                        "Try: `ADD FR1234 2026-05-20 VNO BVA` with origin and destination."
                     )
                 return
             await message.answer(
-                "Usage: `ADD FR1234 2026-05-20`"
+                "Usage: `ADD FR1234 2026-05-20` or `ADD FR1234 2026-05-20 VNO BVA`"
             )
             return
 
